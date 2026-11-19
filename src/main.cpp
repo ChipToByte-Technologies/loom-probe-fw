@@ -16,6 +16,7 @@
 #include <WebServer.h>
 #include <esp_ota_ops.h>
 #include <Update.h>
+#include <LittleFS.h>
 // secrets.h is OPTIONAL: present on USB builds (seeds the ESP32's flash storage), absent on OTA builds.
 #if __has_include("secrets.h") && !defined(NO_SECRETS)
 #include "secrets.h"
@@ -191,9 +192,60 @@ static void ledUpdate() {
 WiFiClientSecure tls; PubSubClient mqtt(tls); WiFiMulti wifiMulti;
 static bool pub(const char* t, const char* p, bool retained = false) { bool ok = mqtt.publish(t, p, retained); if (ok) ledPulse(); return ok; }
 static char tEvt[64], tSum[64], tStatus[64], tCmd[64];
-static const int QN = 120; static String q[QN]; static int qHead = 0, qLen = 0;
-static void enqueue(const String &s) { int i = (qHead + qLen) % QN; if (qLen == QN) { qHead = (qHead + 1) % QN; qLen--; } q[i] = s; qLen++; }
-static void flushQueue() { while (qLen && mqtt.connected()) { if (!pub(tEvt, q[qHead].c_str())) break; qHead = (qHead + 1) % QN; qLen--; } }
+// ---------------- store-and-forward queue in flash (LittleFS on the 'spiffs' partition) ----------------
+// Events always go through the queue when offline or when a backlog exists (keeps order).
+// Summaries are queued only while offline, one every 2 min. Survives power cuts and reboots.
+// Credentials live in NVS (a separate partition) and are never touched by this.
+static bool fsOk = false;
+struct FQ { const char* path; const char* posPath; size_t limit; uint32_t pending; };
+static FQ qEvt = {"/evq", "/evq.pos", 512 * 1024, 0}, qSum = {"/smq", "/smq.pos", 512 * 1024, 0};
+static uint32_t readPos(FQ &q) { File f = LittleFS.open(q.posPath, "r"); if (!f) return 0; uint32_t p = f.parseInt(); f.close(); return p; }
+static void writePos(FQ &q, uint32_t p) { File f = LittleFS.open(q.posPath, "w"); if (f) { f.print(p); f.close(); } }
+static uint32_t countPending(FQ &q) {
+  File f = LittleFS.open(q.path, "r"); if (!f) return 0; f.seek(readPos(q)); uint32_t n = 0;
+  while (f.available()) if (f.read() == '\n') n++; f.close(); return n;
+}
+static void compact(FQ &q) {   // file over its limit: keep only the newest half (oldest data dropped first)
+  File in = LittleFS.open(q.path, "r"); if (!in) return;
+  size_t sz = in.size(); size_t from = max((size_t)readPos(q), sz - q.limit / 2);
+  in.seek(from); if (from > 0) in.readStringUntil('\n');                 // align to a line start
+  File out = LittleFS.open("/tmpq", "w"); uint8_t buf[512]; size_t n;
+  while ((n = in.read(buf, sizeof buf)) > 0) out.write(buf, n);
+  in.close(); out.close(); LittleFS.remove(q.path); LittleFS.rename("/tmpq", q.path); writePos(q, 0);
+  q.pending = countPending(q); Serial.printf("FQ %s compacted, %u pending\n", q.path, q.pending);
+}
+static bool fqPush(FQ &q, const String &line) {
+  if (!fsOk) return false;
+  File f = LittleFS.open(q.path, "a"); if (!f) return false;
+  f.println(line); size_t sz = f.size(); f.close(); q.pending++;
+  if (sz > q.limit) compact(q);
+  return true;
+}
+// Send up to maxLines from the queue; advance the read position only for lines handed to the broker.
+// (PubSubClient publishes at QoS 0: a line is counted sent once the TCP write succeeds and the link is still up.)
+static void fqFlush(FQ &q, const char* topic, int maxLines) {
+  if (!fsOk || !q.pending || !mqtt.connected()) return;
+  File f = LittleFS.open(q.path, "r"); if (!f) { q.pending = 0; return; }
+  uint32_t pos = readPos(q); f.seek(pos); int sent = 0;
+  while (f.available() && sent < maxLines) {
+    String line = f.readStringUntil('\n'); line.trim();
+    if (line.length() && !pub(topic, line.c_str())) break;
+    mqtt.loop(); if (!mqtt.connected()) break;
+    pos = f.position(); sent++; if (q.pending) q.pending--;
+  }
+  bool done = !f.available(); f.close();
+  if (done && pos > 0) { LittleFS.remove(q.path); LittleFS.remove(q.posPath); q.pending = 0; }
+  else writePos(q, pos);
+  if (sent) Serial.printf("FQ %s sent %d, %u pending\n", q.path, sent, q.pending);
+}
+static void fsInit() {
+  fsOk = LittleFS.begin(true);                      // formats the empty partition on first boot
+  if (!fsOk) { Serial.println("FQ: LittleFS mount FAILED - events only sent live"); return; }
+  qEvt.pending = countPending(qEvt); qSum.pending = countPending(qSum);
+  Serial.printf("FQ: flash %u/%u KB used, backlog events=%u summaries=%u\n",
+    LittleFS.usedBytes() / 1024, LittleFS.totalBytes() / 1024, qEvt.pending, qSum.pending);
+}
+static void flushQueue() { fqFlush(qEvt, tEvt, 10); if (!qEvt.pending) fqFlush(qSum, tSum, 10); }
 
 static String isoNow() {
   time_t t = time(nullptr); if (t < 1700000000) return String("ms:") + millis();
@@ -202,7 +254,8 @@ static String isoNow() {
 static void evt(const char* type, const String &extra) {
   String s = String("{\"ts\":\"") + isoNow() + "\",\"type\":\"" + type + "\"" + (extra.length() ? "," + extra : "") + "}";
   Serial.println("EVT " + s);
-  if (mqtt.connected()) { if (!pub(tEvt, s.c_str())) enqueue(s); } else enqueue(s);
+  bool sent = mqtt.connected() && !qEvt.pending && pub(tEvt, s.c_str());   // live only if no backlog (keeps order)
+  if (!sent) fqPush(qEvt, s);
 }
 
 static void doOta(const String &url) {
@@ -220,7 +273,7 @@ static void doOta(const String &url) {
 static void onCmd(char* topic, byte* p, unsigned int n) {
   String c; for (unsigned i = 0; i < n; i++) c += (char)p[i]; c.trim();
   Serial.println("CMD " + c);
-  if (c == "ping") evt("pong", "\"fw\":\"" PROBE_FW_VERSION "\",\"queued\":" + String(qLen));
+  if (c == "ping") evt("pong", "\"fw\":\"" PROBE_FW_VERSION "\",\"queued\":" + String(qEvt.pending + qSum.pending));
   else if (c == "reboot") { evt("reboot", ""); mqtt.loop(); delay(300); ESP.restart(); }
   else if (c == "ota latest") doOta(OTA_LATEST_URL);
   else if (c.startsWith("webpass ") && c.length() >= 16) { prefs.putString("webpass", c.substring(8)); evt("cfg", "\"webpass\":\"changed\""); }
@@ -239,7 +292,7 @@ static void onCmd(char* topic, byte* p, unsigned int n) {
   else if (c == "info") {
     const esp_partition_t* run = esp_ota_get_running_partition();
     evt("info", "\"fw\":\"" PROBE_FW_VERSION "\",\"part\":\"" + String(run ? run->label : "?") + "\",\"ssid\":\"" + WiFi.SSID() +
-        "\",\"wifi1\":\"" + cfg.ssid1 + "\",\"wifi2\":\"" + cfg.ssid2 + "\",\"rssi\":" + String(WiFi.RSSI()) + ",\"heap\":" + String(ESP.getFreeHeap()));
+        "\",\"wifi1\":\"" + cfg.ssid1 + "\",\"wifi2\":\"" + cfg.ssid2 + "\",\"rssi\":" + String(WiFi.RSSI()) + ",\"heap\":" + String(ESP.getFreeHeap()) + ",\"fs_kb\":" + String(fsOk ? LittleFS.usedBytes() / 1024 : 0) + ",\"backlog_evt\":" + String(qEvt.pending) + ",\"backlog_sum\":" + String(qSum.pending));
   }
 }
 
@@ -271,7 +324,7 @@ void setup() {
   pinMode(PIN_PICK, INPUT_PULLUP); pinMode(PIN_WARP, INPUT_PULLUP); pinMode(PIN_WEFT, INPUT_PULLUP);
   warp.on = warp.raw = readOn(PIN_WARP); weft.on = weft.raw = readOn(PIN_WEFT);
   attachInterrupt(PIN_PICK, onPick, FALLING);
-  loadCfg(); otaBootCheck();
+  loadCfg(); otaBootCheck(); fsInit();
   const char* id = cfg.id.c_str();
   snprintf(tEvt, sizeof tEvt, "loom/%s/evt", id);  snprintf(tSum, sizeof tSum, "loom/%s/sum", id);
   snprintf(tStatus, sizeof tStatus, "loom/%s/status", id); snprintf(tCmd, sizeof tCmd, "loom/%s/cmd", id);
@@ -346,9 +399,13 @@ void loop() {
     String s = String("{\"ts\":\"") + isoNow() + "\",\"state\":\"" + (st == RUNNING || st == STOPPING ? "running" : "stopped") +
       "\",\"rpm\":" + String(rpm, 1) + ",\"picks_10s\":" + String(dp / PULSES_PER_REV) +
       ",\"picks_total\":" + String(pc / PULSES_PER_REV) + ",\"warp_on\":" + String(warp.on) + ",\"weft_on\":" + String(weft.on) +
-      ",\"raw_10s\":" + String(dr) + ",\"min_gap_ms\":" + String(mg == 0xFFFFFFFF ? 0 : mg / 1000) + ",\"rssi\":" + String(WiFi.RSSI()) + ",\"queued\":" + String(qLen) + ",\"up_s\":" + String(now / 1000) + "}";
+      ",\"raw_10s\":" + String(dr) + ",\"min_gap_ms\":" + String(mg == 0xFFFFFFFF ? 0 : mg / 1000) + ",\"rssi\":" + String(WiFi.RSSI()) + ",\"queued\":" + String(qEvt.pending + qSum.pending) + ",\"up_s\":" + String(now / 1000) + "}";
     Serial.println("SUM " + s);
-    if (mqtt.connected()) pub(tSum, s.c_str());
+    static uint32_t lastOfflineSum = 0;
+    if (mqtt.connected() && !qSum.pending) pub(tSum, s.c_str());
+    else if (now - lastOfflineSum >= 120000) {        // offline: keep one summary every 2 min in flash
+      lastOfflineSum = now; s.remove(s.length() - 1); s += ",\"buffered\":true}"; fqPush(qSum, s);
+    }
   }
   delay(2);
 }
