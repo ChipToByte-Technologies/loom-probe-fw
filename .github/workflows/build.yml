@@ -1,0 +1,35 @@
+name: build-firmware
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: pio-${{ hashFiles('platformio.ini') }}
+      - run: pip install platformio
+      - name: Build OTA image (no secrets; credentials live in the ESP32's flash storage)
+        env:
+          PLATFORMIO_BUILD_FLAGS: -DPROBE_FW_VERSION=\"${{ github.ref_type == 'tag' && github.ref_name || format('main-{0}', github.sha) }}\"
+        run: pio run -e ota
+      - run: cp .pio/build/ota/firmware.bin firmware.bin && sha256sum firmware.bin | tee firmware.sha256
+      - uses: actions/upload-artifact@v4
+        with: { name: firmware, path: 'firmware.*' }
+      - name: Publish release (tags only)
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            firmware.bin
+            firmware.sha256
+          generate_release_notes: true
