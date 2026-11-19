@@ -7,7 +7,7 @@ weft·warp·manual, picks, RPM) over MQTT/TLS and updates itself over the air.
 `include/secrets.h` (see `secrets.example.h`) into the ESP32's flash storage; OTA images read them from there.
 
 ## Updating
-- **Remote (GitHub):** push a tag `vX.Y.Z` → Actions builds and publishes `firmware.bin` to the release →
+- **Remote (GitHub):** bump `VERSION` on main → Actions builds and publishes `firmware.bin` to the release →
   send `ota latest` on MQTT topic `loom/<id>/cmd`.
 - **On the LAN:** open `http://<device-ip>/` (user `admin`), upload `firmware.bin`.
 - A new image must reach MQTT within 5 min (and not crash-loop), otherwise the device boots back into the previous version.
