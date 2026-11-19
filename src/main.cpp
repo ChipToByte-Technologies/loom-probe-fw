@@ -165,12 +165,29 @@ static void setupWeb() {
   web.begin(); Serial.println("Web page on port 80 (user admin)");
 }
 
+
+// ---------------- status LED on GPIO2 ----------------
+// Blink on every MQTT publish; "breathing" fade while Wi-Fi is disconnected; off otherwise.
+static const int LED_PIN = 2, LED_CH = 0;
+static uint32_t ledBlinkUntil = 0;
+static void ledInit() { ledcSetup(LED_CH, 5000, 8); ledcAttachPin(LED_PIN, LED_CH); ledcWrite(LED_CH, 0); }
+static void ledPulse() { ledBlinkUntil = millis() + 40; }
+static void ledUpdate() {
+  uint32_t now = millis();
+  if (WiFi.status() != WL_CONNECTED) {                 // breathe: 2 s up/down, gamma-ish curve
+    uint32_t ph = now % 2000, v = ph < 1000 ? ph * 255 / 1000 : (2000 - ph) * 255 / 1000;
+    ledcWrite(LED_CH, v * v / 255); return;
+  }
+  ledcWrite(LED_CH, now < ledBlinkUntil ? 255 : 0);
+}
+
 // ---------------- MQTT + offline buffer ----------------
 WiFiClientSecure tls; PubSubClient mqtt(tls); WiFiMulti wifiMulti;
+static bool pub(const char* t, const char* p, bool retained = false) { bool ok = mqtt.publish(t, p, retained); if (ok) ledPulse(); return ok; }
 static char tEvt[64], tSum[64], tStatus[64], tCmd[64];
 static const int QN = 120; static String q[QN]; static int qHead = 0, qLen = 0;
 static void enqueue(const String &s) { int i = (qHead + qLen) % QN; if (qLen == QN) { qHead = (qHead + 1) % QN; qLen--; } q[i] = s; qLen++; }
-static void flushQueue() { while (qLen && mqtt.connected()) { if (!mqtt.publish(tEvt, q[qHead].c_str())) break; qHead = (qHead + 1) % QN; qLen--; } }
+static void flushQueue() { while (qLen && mqtt.connected()) { if (!pub(tEvt, q[qHead].c_str())) break; qHead = (qHead + 1) % QN; qLen--; } }
 
 static String isoNow() {
   time_t t = time(nullptr); if (t < 1700000000) return String("ms:") + millis();
@@ -179,7 +196,7 @@ static String isoNow() {
 static void evt(const char* type, const String &extra) {
   String s = String("{\"ts\":\"") + isoNow() + "\",\"type\":\"" + type + "\"" + (extra.length() ? "," + extra : "") + "}";
   Serial.println("EVT " + s);
-  if (mqtt.connected()) { if (!mqtt.publish(tEvt, s.c_str())) enqueue(s); } else enqueue(s);
+  if (mqtt.connected()) { if (!pub(tEvt, s.c_str())) enqueue(s); } else enqueue(s);
 }
 
 static void doOta(const String &url) {
@@ -225,7 +242,7 @@ static uint32_t lastWifiLog = 0; static bool wifiWasUp = false;
 static void ensureConn() {
   if (WiFi.status() != WL_CONNECTED) {
     if (wifiWasUp) { wifiWasUp = false; wifiDownSince = millis(); Serial.println("WiFi lost"); }
-    static uint32_t lastMulti = 0; if (millis() - lastMulti > 3000) { lastMulti = millis(); wifiMulti.run(2500); }
+    static uint32_t lastMulti = 0; if (millis() - lastMulti > 20000) { lastMulti = millis(); wifiMulti.run(1500); }   // short + infrequent so the LED keeps breathing
     if (!portalOn && millis() - wifiDownSince > PORTAL_AFTER_MS) startPortal();
     if (millis() - lastWifiLog > 10000) { lastWifiLog = millis(); Serial.printf("WiFi connecting (%s / %s) status %d\n", cfg.ssid1.c_str(), cfg.ssid2.c_str(), WiFi.status()); }
     return;
@@ -236,7 +253,7 @@ static void ensureConn() {
   String cid = String("loom-") + cfg.id + "-" + String((uint32_t)ESP.getEfuseMac(), HEX);
   if (mqtt.connect(cid.c_str(), cfg.user.c_str(), cfg.pass.c_str(), tStatus, 1, true, "{\"online\":false}")) {
     String s = String("{\"online\":true,\"fw\":\"" PROBE_FW_VERSION "\",\"ip\":\"") + WiFi.localIP().toString() + "\",\"rssi\":" + WiFi.RSSI() + "}";
-    mqtt.publish(tStatus, s.c_str(), true);
+    pub(tStatus, s.c_str(), true);
     mqtt.subscribe(tCmd, 1);
     Serial.println("MQTT connected"); otaConfirm(); flushQueue();
   } else Serial.printf("MQTT connect failed rc=%d\n", mqtt.state());
@@ -244,6 +261,7 @@ static void ensureConn() {
 
 void setup() {
   Serial.begin(115200); delay(200);
+  ledInit();
   pinMode(PIN_PICK, INPUT_PULLUP); pinMode(PIN_WARP, INPUT_PULLUP); pinMode(PIN_WEFT, INPUT_PULLUP);
   warp.on = warp.raw = readOn(PIN_WARP); weft.on = weft.raw = readOn(PIN_WEFT);
   attachInterrupt(PIN_PICK, onPick, FALLING);
@@ -274,7 +292,7 @@ void setup() {
 static uint32_t lastSum = 0, lastSumPulses = 0, lastSumRaw = 0;
 void loop() {
   uint32_t now = millis();
-  ensureConn(); mqtt.loop(); flushQueue(); otaTrialTimeout(); web.handleClient();
+  ensureConn(); mqtt.loop(); flushQueue(); otaTrialTimeout(); web.handleClient(); ledUpdate();
 
   noInterrupts(); uint32_t pc = pulseCount, lp = lastPulseUs, per = periodUs; interrupts();
   uint32_t sinceLastPulseMs = (micros() - lp) / 1000;
@@ -324,7 +342,7 @@ void loop() {
       ",\"picks_total\":" + String(pc / PULSES_PER_REV) + ",\"warp_on\":" + String(warp.on) + ",\"weft_on\":" + String(weft.on) +
       ",\"raw_10s\":" + String(dr) + ",\"min_gap_ms\":" + String(mg == 0xFFFFFFFF ? 0 : mg / 1000) + ",\"rssi\":" + String(WiFi.RSSI()) + ",\"queued\":" + String(qLen) + ",\"up_s\":" + String(now / 1000) + "}";
     Serial.println("SUM " + s);
-    if (mqtt.connected()) mqtt.publish(tSum, s.c_str());
+    if (mqtt.connected()) pub(tSum, s.c_str());
   }
   delay(2);
 }
