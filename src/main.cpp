@@ -170,15 +170,21 @@ static void setupWeb() {
 // Blink on every MQTT publish; "breathing" fade while Wi-Fi is disconnected; off otherwise.
 static const int LED_PIN = 2, LED_CH = 0;
 static uint32_t ledBlinkUntil = 0;
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+static void ledInit() { ledcAttach(LED_PIN, 5000, 8); ledcWrite(LED_PIN, 0); }
+static inline void ledSet(uint32_t v) { ledcWrite(LED_PIN, v); }
+#else
 static void ledInit() { ledcSetup(LED_CH, 5000, 8); ledcAttachPin(LED_PIN, LED_CH); ledcWrite(LED_CH, 0); }
+static inline void ledSet(uint32_t v) { ledcWrite(LED_CH, v); }
+#endif
 static void ledPulse() { ledBlinkUntil = millis() + 40; }
 static void ledUpdate() {
   uint32_t now = millis();
   if (WiFi.status() != WL_CONNECTED) {                 // breathe: 2 s up/down, gamma-ish curve
     uint32_t ph = now % 2000, v = ph < 1000 ? ph * 255 / 1000 : (2000 - ph) * 255 / 1000;
-    ledcWrite(LED_CH, v * v / 255); return;
+    ledSet(v * v / 255); return;
   }
-  ledcWrite(LED_CH, now < ledBlinkUntil ? 255 : 0);
+  ledSet(now < ledBlinkUntil ? 255 : 0);
 }
 
 // ---------------- MQTT + offline buffer ----------------
