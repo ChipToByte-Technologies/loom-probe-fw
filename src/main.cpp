@@ -17,6 +17,8 @@
 #include <esp_ota_ops.h>
 #include <Update.h>
 #include <LittleFS.h>
+#include <esp_task_wdt.h>
+#include <esp_system.h>
 // secrets.h is OPTIONAL: present on USB builds (seeds the ESP32's flash storage), absent on OTA builds.
 #if __has_include("secrets.h") && !defined(NO_SECRETS)
 #include "secrets.h"
@@ -160,7 +162,7 @@ static void setupWeb() {
       HTTPUpload& u = web.upload();
       if (!web.authenticate("admin", webPass().c_str())) return;
       if (u.status == UPLOAD_FILE_START) { Serial.printf("Web OTA: %s\n", u.filename.c_str()); Update.begin(UPDATE_SIZE_UNKNOWN); }
-      else if (u.status == UPLOAD_FILE_WRITE) Update.write(u.buf, u.currentSize);
+      else if (u.status == UPLOAD_FILE_WRITE) { Update.write(u.buf, u.currentSize); esp_task_wdt_reset(); }
       else if (u.status == UPLOAD_FILE_END) { if (Update.end(true)) Serial.printf("Web OTA: %u bytes OK\n", u.totalSize); else Update.printError(Serial); }
     });
   web.begin(); Serial.println("Web page on port 80 (user admin)");
@@ -191,61 +193,116 @@ static void ledUpdate() {
 // ---------------- MQTT + offline buffer ----------------
 WiFiClientSecure tls; PubSubClient mqtt(tls); WiFiMulti wifiMulti;
 static bool pub(const char* t, const char* p, bool retained = false) { bool ok = mqtt.publish(t, p, retained); if (ok) ledPulse(); return ok; }
-static char tEvt[64], tSum[64], tStatus[64], tCmd[64];
-// ---------------- store-and-forward queue in flash (LittleFS on the 'spiffs' partition) ----------------
-// Events always go through the queue when offline or when a backlog exists (keeps order).
-// Summaries are queued only while offline, one every 2 min. Survives power cuts and reboots.
-// Credentials live in NVS (a separate partition) and are never touched by this.
+static char tEvt[64], tSum[64], tStatus[64], tCmd[64], tAck[64];
+// ---------------- end-to-end delivery queue in flash (LittleFS on the 'spiffs' partition) ----------------
+// Every event and summary is written to one flash queue with a sequence number (b = boot id, n = counter).
+// Lines stay in flash until zener's backend confirms they are SAVED IN THE DATABASE (ack on loom/<id>/ack).
+// Unconfirmed lines are re-sent (go-back-N). Survives power cuts. Credentials (NVS) are never touched.
 static bool fsOk = false;
-struct FQ { const char* path; const char* posPath; size_t limit; uint32_t pending; };
-static FQ qEvt = {"/evq", "/evq.pos", 512 * 1024, 0}, qSum = {"/smq", "/smq.pos", 512 * 1024, 0};
-static uint32_t readPos(FQ &q) { File f = LittleFS.open(q.posPath, "r"); if (!f) return 0; uint32_t p = f.parseInt(); f.close(); return p; }
-static void writePos(FQ &q, uint32_t p) { File f = LittleFS.open(q.posPath, "w"); if (f) { f.print(p); f.close(); } }
-static uint32_t countPending(FQ &q) {
-  File f = LittleFS.open(q.path, "r"); if (!f) return 0; f.seek(readPos(q)); uint32_t n = 0;
-  while (f.available()) if (f.read() == '\n') n++; f.close(); return n;
+static const char* QPATH = "/q"; static const char* QPOS = "/q.pos";
+static const size_t QLIMIT = 1000 * 1024;            // ~1 MB ≈ 5,000 lines ≈ 6 days offline at B9 rates
+static const int WINDOW = 20;                         // lines in flight before waiting for acks
+static uint32_t bootId = 0, seqN = 0;                 // seqN counts records in this boot
+static uint32_t qPos = 0, qSendPos = 0, qPending = 0; // acked read position, next send position, lines after qPos
+static int inflight = 0;
+static uint32_t lastAckMs = 0, lastSentMs = 0, resendTimeout = 20000, lastPosSave = 0, savedPos = 0;
+static bool ackHealthy() { return millis() - lastAckMs < 60000; }   // backend confirmed something in the last minute
+
+static void savePos(bool force = false) {
+  if (!fsOk || (!force && (qPos == savedPos || millis() - lastPosSave < 30000))) return;
+  File f = LittleFS.open(QPOS, "w"); if (f) { f.print(qPos); f.close(); }
+  savedPos = qPos; lastPosSave = millis();
 }
-static void compact(FQ &q) {   // file over its limit: keep only the newest half (oldest data dropped first)
-  File in = LittleFS.open(q.path, "r"); if (!in) return;
-  size_t sz = in.size(); size_t from = max((size_t)readPos(q), sz - q.limit / 2);
-  in.seek(from); if (from > 0) in.readStringUntil('\n');                 // align to a line start
-  File out = LittleFS.open("/tmpq", "w"); uint8_t buf[512]; size_t n;
-  while ((n = in.read(buf, sizeof buf)) > 0) out.write(buf, n);
-  in.close(); out.close(); LittleFS.remove(q.path); LittleFS.rename("/tmpq", q.path); writePos(q, 0);
-  q.pending = countPending(q); Serial.printf("FQ %s compacted, %u pending\n", q.path, q.pending);
+static bool lineSeq(const String &l, uint32_t &b, uint32_t &n) {   // parse ,"b":X,"n":Y
+  int i = l.indexOf("\"b\":"), j = l.indexOf("\"n\":");
+  if (i < 0 || j < 0) return false;
+  b = strtoul(l.c_str() + i + 4, nullptr, 10); n = strtoul(l.c_str() + j + 4, nullptr, 10); return true;
 }
-static bool fqPush(FQ &q, const String &line) {
-  if (!fsOk) return false;
-  File f = LittleFS.open(q.path, "a"); if (!f) return false;
-  f.println(line); size_t sz = f.size(); f.close(); q.pending++;
-  if (sz > q.limit) compact(q);
-  return true;
+static void compactQ() {      // over the limit: drop the oldest unconfirmed lines, keep the newest ~60%
+  File in = LittleFS.open(QPATH, "r"); if (!in) return;
+  size_t sz = in.size(), from = max((size_t)qPos, sz - (QLIMIT * 6) / 10);
+  in.seek(from); if (from > qPos) in.readStringUntil('\n');
+  File out = LittleFS.open("/qtmp", "w"); uint8_t buf[512]; size_t k;
+  while ((k = in.read(buf, sizeof buf)) > 0) { out.write(buf, k); esp_task_wdt_reset(); }
+  in.close(); out.close(); LittleFS.remove(QPATH); LittleFS.rename("/qtmp", QPATH);
+  qPos = qSendPos = 0; inflight = 0; savePos(true);
+  File f = LittleFS.open(QPATH, "r"); qPending = 0; while (f && f.available()) if (f.read() == '\n') qPending++; if (f) f.close();
+  Serial.printf("Q compacted (oldest dropped), %u pending\n", qPending);
 }
-// Send up to maxLines from the queue; advance the read position only for lines handed to the broker.
-// (PubSubClient publishes at QoS 0: a line is counted sent once the TCP write succeeds and the link is still up.)
-static void fqFlush(FQ &q, const char* topic, int maxLines) {
-  if (!fsOk || !q.pending || !mqtt.connected()) return;
-  File f = LittleFS.open(q.path, "r"); if (!f) { q.pending = 0; return; }
-  uint32_t pos = readPos(q); f.seek(pos); int sent = 0;
-  while (f.available() && sent < maxLines) {
-    String line = f.readStringUntil('\n'); line.trim();
-    if (line.length() && !pub(topic, line.c_str())) break;
-    mqtt.loop(); if (!mqtt.connected()) break;
-    pos = f.position(); sent++; if (q.pending) q.pending--;
+static void qPush(char kind, String json) {          // kind 'E' event, 'S' summary
+  json.remove(json.length() - 1);
+  json += ",\"b\":" + String(bootId) + ",\"n\":" + String(++seqN) + "}";
+  if (!fsOk) { pub(kind == 'E' ? tEvt : tSum, json.c_str()); return; }   // no flash: best effort live
+  File f = LittleFS.open(QPATH, "a"); if (!f) return;
+  f.print(kind); f.print('|'); f.println(json); size_t sz = f.size(); f.close(); qPending++;
+  if (sz > QLIMIT) compactQ();
+}
+static String fixTs(const String &line) {             // "ms:<uptime>" -> real time, if same boot and clock now set
+  int i = line.indexOf("\"ts\":\"ms:"); if (i < 0) return line;
+  uint32_t b, n; time_t now = time(nullptr);
+  if (now < 1700000000 || !lineSeq(line, b, n) || b != bootId) return line;     // other boot: backend uses receive time
+  uint32_t up = strtoul(line.c_str() + i + 9, nullptr, 10);
+  time_t t = now - (time_t)((millis() - up) / 1000);
+  struct tm tmv; localtime_r(&t, &tmv); char iso[32]; strftime(iso, sizeof iso, "%Y-%m-%dT%H:%M:%S+05:30", &tmv);
+  int e = line.indexOf('"', i + 6);
+  return line.substring(0, i) + "\"ts\":\"" + iso + line.substring(e);
+}
+static void qSend() {                                  // send up to WINDOW unconfirmed lines
+  if (!fsOk || !mqtt.connected()) return;
+  if (inflight > 0 && millis() - lastSentMs > resendTimeout && millis() - lastAckMs > resendTimeout) {
+    qSendPos = qPos; inflight = 0;                                     // no confirmation: go back and resend
+    resendTimeout = min<uint32_t>(resendTimeout * 2, 300000);          // back off up to 5 min
+    Serial.printf("Q resend from %u (timeout now %u s)\n", qPos, resendTimeout / 1000);
   }
-  bool done = !f.available(); f.close();
-  if (done && pos > 0) { LittleFS.remove(q.path); LittleFS.remove(q.posPath); q.pending = 0; }
-  else writePos(q, pos);
-  if (sent) Serial.printf("FQ %s sent %d, %u pending\n", q.path, sent, q.pending);
+  if (inflight >= WINDOW) return;
+  File f = LittleFS.open(QPATH, "r"); if (!f) return;
+  f.seek(qSendPos);
+  while (f.available() && inflight < WINDOW) {
+    String line = f.readStringUntil('\n'); line.trim();
+    if (line.length() > 2) {
+      String body = fixTs(line.substring(2));
+      if (!pub(line[0] == 'E' ? tEvt : tSum, body.c_str())) break;
+    }
+    qSendPos = f.position(); inflight++; lastSentMs = millis();
+    mqtt.loop(); if (!mqtt.connected()) break;
+  }
+  f.close();
+}
+static void qAck(uint32_t ab, uint32_t an) {          // backend saved everything of boot ab up to n
+  File f = LittleFS.open(QPATH, "r"); if (!f) return;
+  f.seek(qPos); bool moved = false;
+  while (f.available()) {
+    uint32_t pos = f.position(); String line = f.readStringUntil('\n'); uint32_t b, n;
+    if (!lineSeq(line, b, n)) { qPos = f.position(); moved = true; if (qPending) qPending--; continue; }   // malformed: skip
+    if (b == ab && n <= an) { qPos = f.position(); moved = true; if (qPending) qPending--; continue; }
+    if (b == ab && n > an + 1) {                                         // backend misses lines we no longer have
+      String g = "{\"b\":" + String(b) + ",\"from\":" + String(an + 1) + ",\"to\":" + String(n - 1) + "}";
+      char tGap[64]; snprintf(tGap, sizeof tGap, "loom/%s/gap", cfg.id.c_str()); pub(tGap, g.c_str());
+    }
+    (void)pos; break;
+  }
+  bool atEnd = !f.available() && qPos == f.size(); f.close();
+  if (moved) { lastAckMs = millis(); resendTimeout = 20000; }
+  if (qSendPos < qPos) qSendPos = qPos;
+  // recount in-flight lines between qPos and qSendPos
+  inflight = 0; File g = LittleFS.open(QPATH, "r");
+  if (g) { g.seek(qPos); while (g.available() && g.position() < qSendPos) if (g.read() == '\n') inflight++; g.close(); }
+  if (atEnd && qSendPos == qPos) { LittleFS.remove(QPATH); qPos = qSendPos = 0; qPending = 0; inflight = 0; }
+  savePos(atEnd);
 }
 static void fsInit() {
+  bootId = prefs.getUInt("boot", 0) + 1; prefs.putUInt("boot", bootId);
   fsOk = LittleFS.begin(true);                      // formats the empty partition on first boot
-  if (!fsOk) { Serial.println("FQ: LittleFS mount FAILED - events only sent live"); return; }
-  qEvt.pending = countPending(qEvt); qSum.pending = countPending(qSum);
-  Serial.printf("FQ: flash %u/%u KB used, backlog events=%u summaries=%u\n",
-    LittleFS.usedBytes() / 1024, LittleFS.totalBytes() / 1024, qEvt.pending, qSum.pending);
+  if (!fsOk) { Serial.println("Q: LittleFS mount FAILED - live only"); return; }
+  LittleFS.remove("/evq"); LittleFS.remove("/evq.pos"); LittleFS.remove("/smq"); LittleFS.remove("/smq.pos");  // v2.2 queues
+  File p = LittleFS.open(QPOS, "r"); if (p) { qPos = p.parseInt(); p.close(); }
+  File f = LittleFS.open(QPATH, "r");
+  if (f) { if (qPos > f.size()) qPos = 0; f.seek(qPos); while (f.available()) if (f.read() == '\n') qPending++; f.close(); } else qPos = 0;
+  qSendPos = qPos; savedPos = qPos;
+  Serial.printf("Q: boot %u, flash %u/%u KB, %u lines waiting for confirmation\n",
+    bootId, LittleFS.usedBytes() / 1024, LittleFS.totalBytes() / 1024, qPending);
 }
-static void flushQueue() { fqFlush(qEvt, tEvt, 10); if (!qEvt.pending) fqFlush(qSum, tSum, 10); }
+static void flushQueue() { qSend(); savePos(); }
 
 static String isoNow() {
   time_t t = time(nullptr); if (t < 1700000000) return String("ms:") + millis();
@@ -254,8 +311,7 @@ static String isoNow() {
 static void evt(const char* type, const String &extra) {
   String s = String("{\"ts\":\"") + isoNow() + "\",\"type\":\"" + type + "\"" + (extra.length() ? "," + extra : "") + "}";
   Serial.println("EVT " + s);
-  bool sent = mqtt.connected() && !qEvt.pending && pub(tEvt, s.c_str());   // live only if no backlog (keeps order)
-  if (!sent) fqPush(qEvt, s);
+  qPush('E', s);
 }
 
 static void doOta(const String &url) {
@@ -263,6 +319,7 @@ static void doOta(const String &url) {
   prefs.putBool("ota_trial", true); prefs.putUChar("ota_boots", 0);     // new image must prove itself
   httpUpdate.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
   httpUpdate.rebootOnUpdate(true);
+  httpUpdate.onProgress([](int, int) { esp_task_wdt_reset(); });
   t_httpUpdate_return r;
   if (url.startsWith("https://")) { WiFiClientSecure c; c.setInsecure(); r = httpUpdate.update(c, url); }
   else { WiFiClient c; r = httpUpdate.update(c, url); }
@@ -272,10 +329,17 @@ static void doOta(const String &url) {
 }
 static void onCmd(char* topic, byte* p, unsigned int n) {
   String c; for (unsigned i = 0; i < n; i++) c += (char)p[i]; c.trim();
+  if (strcmp(topic, tAck) == 0) {                     // {"b":X,"n":Y} from the backend
+    int i = c.indexOf("\"b\":"), j = c.indexOf("\"n\":");
+    if (i >= 0 && j >= 0) qAck(strtoul(c.c_str() + i + 4, nullptr, 10), strtoul(c.c_str() + j + 4, nullptr, 10));
+    return;
+  }
   Serial.println("CMD " + c);
-  if (c == "ping") evt("pong", "\"fw\":\"" PROBE_FW_VERSION "\",\"queued\":" + String(qEvt.pending + qSum.pending));
+  if (c == "ping") evt("pong", "\"fw\":\"" PROBE_FW_VERSION "\",\"queued\":" + String(qPending) + ",\"fw\":\"" PROBE_FW_VERSION "\",\"boot\":" + String(bootId));
   else if (c == "reboot") { evt("reboot", ""); mqtt.loop(); delay(300); ESP.restart(); }
   else if (c == "ota latest") doOta(OTA_LATEST_URL);
+  else if (c.startsWith("ntp ")) { prefs.putString("ntp", c.substring(4)); evt("cfg", "\"ntp\":\"" + c.substring(4) + "\",\"note\":\"applied\"");
+    configTzTime("IST-5:30", prefs.getString("ntp").c_str(), "pool.ntp.org", "time.google.com"); }
   else if (c.startsWith("webpass ") && c.length() >= 16) { prefs.putString("webpass", c.substring(8)); evt("cfg", "\"webpass\":\"changed\""); }
   else if (c.startsWith("ota ")) doOta(c.substring(4));
   else if (c.startsWith("wifi2 ")) {          // "wifi2 <ssid>|<password>" sets the BACKUP network (primary untouched = safe)
@@ -292,7 +356,7 @@ static void onCmd(char* topic, byte* p, unsigned int n) {
   else if (c == "info") {
     const esp_partition_t* run = esp_ota_get_running_partition();
     evt("info", "\"fw\":\"" PROBE_FW_VERSION "\",\"part\":\"" + String(run ? run->label : "?") + "\",\"ssid\":\"" + WiFi.SSID() +
-        "\",\"wifi1\":\"" + cfg.ssid1 + "\",\"wifi2\":\"" + cfg.ssid2 + "\",\"rssi\":" + String(WiFi.RSSI()) + ",\"heap\":" + String(ESP.getFreeHeap()) + ",\"fs_kb\":" + String(fsOk ? LittleFS.usedBytes() / 1024 : 0) + ",\"backlog_evt\":" + String(qEvt.pending) + ",\"backlog_sum\":" + String(qSum.pending));
+        "\",\"wifi1\":\"" + cfg.ssid1 + "\",\"wifi2\":\"" + cfg.ssid2 + "\",\"rssi\":" + String(WiFi.RSSI()) + ",\"heap\":" + String(ESP.getFreeHeap()) + ",\"fs_kb\":" + String(fsOk ? LittleFS.usedBytes() / 1024 : 0) + ",\"backlog\":" + String(qPending) + ",\"boot\":" + String(bootId) + ",\"ntp\":\"" + prefs.getString("ntp", "pool.ntp.org") + "\"");
   }
 }
 
@@ -313,7 +377,7 @@ static void ensureConn() {
   if (mqtt.connect(cid.c_str(), cfg.user.c_str(), cfg.pass.c_str(), tStatus, 1, true, "{\"online\":false}")) {
     String s = String("{\"online\":true,\"fw\":\"" PROBE_FW_VERSION "\",\"ip\":\"") + WiFi.localIP().toString() + "\",\"rssi\":" + WiFi.RSSI() + "}";
     pub(tStatus, s.c_str(), true);
-    mqtt.subscribe(tCmd, 1);
+    mqtt.subscribe(tCmd, 1); mqtt.subscribe(tAck, 1);
     Serial.println("MQTT connected"); otaConfirm(); flushQueue();
   } else Serial.printf("MQTT connect failed rc=%d\n", mqtt.state());
 }
@@ -321,6 +385,7 @@ static void ensureConn() {
 void setup() {
   Serial.begin(115200); delay(200);
   ledInit();
+  esp_task_wdt_init(30, true); esp_task_wdt_add(NULL);          // reboot if the loop ever hangs for 30 s
   pinMode(PIN_PICK, INPUT_PULLUP); pinMode(PIN_WARP, INPUT_PULLUP); pinMode(PIN_WEFT, INPUT_PULLUP);
   warp.on = warp.raw = readOn(PIN_WARP); weft.on = weft.raw = readOn(PIN_WEFT);
   attachInterrupt(PIN_PICK, onPick, FALLING);
@@ -328,6 +393,7 @@ void setup() {
   const char* id = cfg.id.c_str();
   snprintf(tEvt, sizeof tEvt, "loom/%s/evt", id);  snprintf(tSum, sizeof tSum, "loom/%s/sum", id);
   snprintf(tStatus, sizeof tStatus, "loom/%s/status", id); snprintf(tCmd, sizeof tCmd, "loom/%s/cmd", id);
+  snprintf(tAck, sizeof tAck, "loom/%s/ack", id);
   const esp_partition_t* run = esp_ota_get_running_partition();
   Serial.printf("\n=== LOOM PROBE v%s === id=%s ppr=%d part=%s secrets=%s\n", PROBE_FW_VERSION, id, PULSES_PER_REV, run ? run->label : "?",
 #ifdef HAVE_SECRETS
@@ -341,17 +407,17 @@ void setup() {
   if (cfg.ssid2.length()) wifiMulti.addAP(cfg.ssid2.c_str(), cfg.pass2.c_str());
   wifiDownSince = millis(); wifiMulti.run(5000);
   setupWeb();
-  configTzTime("IST-5:30", "pool.ntp.org", "time.google.com");
+  configTzTime("IST-5:30", prefs.getString("ntp", "pool.ntp.org").c_str(), "pool.ntp.org", "time.google.com");
   tls.setInsecure();                 // probe only: encrypted, server not verified. Production pins the CA.
   mqtt.setServer(cfg.host.c_str(), cfg.port); mqtt.setBufferSize(512); mqtt.setKeepAlive(30); mqtt.setCallback(onCmd);
   stopStartMs = millis();
-  evt("boot", "\"fw\":\"" PROBE_FW_VERSION "\",\"warp_on\":" + String(warp.on) + ",\"weft_on\":" + String(weft.on));
+  evt("boot", "\"fw\":\"" PROBE_FW_VERSION "\",\"reset\":" + String((int)esp_reset_reason()) + ",\"boot\":" + String(bootId) + ",\"warp_on\":" + String(warp.on) + ",\"weft_on\":" + String(weft.on));
 }
 
 static uint32_t lastSum = 0, lastSumPulses = 0, lastSumRaw = 0;
 void loop() {
   uint32_t now = millis();
-  ensureConn(); mqtt.loop(); flushQueue(); otaTrialTimeout(); web.handleClient(); ledUpdate();
+  ensureConn(); mqtt.loop(); flushQueue(); otaTrialTimeout(); web.handleClient(); ledUpdate(); esp_task_wdt_reset();
 
   noInterrupts(); uint32_t pc = pulseCount, lp = lastPulseUs, per = periodUs; interrupts();
   uint32_t sinceLastPulseMs = (micros() - lp) / 1000;
@@ -399,12 +465,13 @@ void loop() {
     String s = String("{\"ts\":\"") + isoNow() + "\",\"state\":\"" + (st == RUNNING || st == STOPPING ? "running" : "stopped") +
       "\",\"rpm\":" + String(rpm, 1) + ",\"picks_10s\":" + String(dp / PULSES_PER_REV) +
       ",\"picks_total\":" + String(pc / PULSES_PER_REV) + ",\"warp_on\":" + String(warp.on) + ",\"weft_on\":" + String(weft.on) +
-      ",\"raw_10s\":" + String(dr) + ",\"min_gap_ms\":" + String(mg == 0xFFFFFFFF ? 0 : mg / 1000) + ",\"rssi\":" + String(WiFi.RSSI()) + ",\"queued\":" + String(qEvt.pending + qSum.pending) + ",\"up_s\":" + String(now / 1000) + "}";
+      ",\"raw_10s\":" + String(dr) + ",\"min_gap_ms\":" + String(mg == 0xFFFFFFFF ? 0 : mg / 1000) + ",\"rssi\":" + String(WiFi.RSSI()) + ",\"queued\":" + String(qPending) + ",\"fw\":\"" PROBE_FW_VERSION "\",\"boot\":" + String(bootId) + ",\"up_s\":" + String(now / 1000) + "}";
     Serial.println("SUM " + s);
-    static uint32_t lastOfflineSum = 0;
-    if (mqtt.connected() && !qSum.pending) pub(tSum, s.c_str());
-    else if (now - lastOfflineSum >= 120000) {        // offline: keep one summary every 2 min in flash
-      lastOfflineSum = now; s.remove(s.length() - 1); s += ",\"buffered\":true}"; fqPush(qSum, s);
+    static uint32_t lastQueuedSum = 0;
+    bool live = mqtt.connected() && ackHealthy();
+    if (live || now - lastQueuedSum >= 120000) {       // offline / unconfirmed: keep one every 2 min
+      lastQueuedSum = now; if (!live) { s.remove(s.length() - 1); s += ",\"buffered\":true}"; }
+      qPush('S', s);
     }
   }
   delay(2);

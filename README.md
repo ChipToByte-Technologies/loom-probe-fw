@@ -13,10 +13,13 @@ weft·warp·manual, picks, RPM) over MQTT/TLS and updates itself over the air.
 - A new image must reach MQTT within 5 min (and not crash-loop), otherwise the device boots back into the previous version.
 
 ## MQTT commands (`loom/<id>/cmd`)
-`ping` · `info` (shows flash backlog) · `reboot` · `ota latest` · `ota <url>` · `wifi2 <ssid>|<pass>` · `wifi_swap` · `webpass <new, 8+ chars>`
+`ping` · `info` (backlog, boot, ntp) · `reboot` · `ota latest` · `ota <url>` · `wifi2 <ssid>|<pass>` · `wifi_swap` · `webpass <new, 8+ chars>` · `ntp <host>`
 
-## Store-and-forward (v2.2)
-Events are kept in flash (LittleFS on the `spiffs` partition, ~512 KB ≈ 3,000 events) whenever the device is
-offline, and survive power cuts and reboots. While offline a summary is also stored every 2 min (marked
-`"buffered":true`). On reconnect the backlog is sent oldest-first with original timestamps; the server
-ignores duplicates. Credentials live in NVS (separate partition) and are never touched.
+## End-to-end delivery (v2.3)
+Every event and summary goes into one flash queue (~1 MB ≈ 6 days offline) with a sequence number
+(`b` = boot id, `n` = counter). The server acknowledges on `loom/<id>/ack` (`{"b":..,"n":..}`) only after the
+record is saved in its database; the device then deletes it. Unconfirmed records are re-sent (go-back-N, backoff
+up to 5 min). If the buffer overflowed, the device reports the dropped range on `loom/<id>/gap`.
+While delivery isn't being confirmed, summaries are kept one per 2 min (`"buffered":true`).
+Timestamps recorded before the clock synced (`ms:<uptime>`) are corrected on send when still in the same boot.
+Watchdog: 30 s. `ntp <host>` sets the time server (e.g. the customer's server on a LAN-only site).
